@@ -3343,12 +3343,16 @@ name = "iceberg-catalog-rest"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "http 1.4.0",
  "iceberg",
  "iceberg_test_utils",
  "itertools 0.13.0",
  "mockito",
+ "reqsign-aws-v4",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
  "reqwest",
  "serde",
  "serde_derive",
@@ -5313,6 +5317,62 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "reqsign-aws-v4"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab367a07c335a3eaa22395a9d9b0031ac73aee5893573281b2fa27bf97dc94f2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "form_urlencoded",
+ "http 1.4.0",
+ "log",
+ "percent-encoding",
+ "quick-xml 0.38.4",
+ "reqsign-core",
+ "rust-ini",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha1",
+]
+
+[[package]]
+name = "reqsign-core"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ba66eb941c0f723269a394baf3b19a2fa697a1e593f3e902779df6c35d24e21"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "form_urlencoded",
+ "hex",
+ "hmac",
+ "http 1.4.0",
+ "jiff",
+ "log",
+ "percent-encoding",
+ "sha1",
+ "sha2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "reqsign-file-read-tokio"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "702f12a867bf8e507de907fa0f4d75b96469ace7edd33fcc1fc8a8ef58f3c8d2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "reqsign-core",
  "tokio",
 ]
 

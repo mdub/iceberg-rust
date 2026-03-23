@@ -17,7 +17,10 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::header::HeaderMap;
@@ -27,6 +30,75 @@ use tokio::sync::Mutex;
 
 use crate::RestCatalogConfig;
 use crate::types::{ErrorResponse, TokenResponse};
+
+/// A trait for signing HTTP requests before they are sent.
+///
+/// Implementations can add authentication headers, compute signatures,
+/// or perform any other request transformation needed for authentication.
+///
+/// The trait operates on [`http::request::Parts`] (the standard `http` crate type)
+/// rather than `reqwest::Request`, to stay framework-agnostic.
+#[async_trait]
+pub trait RequestSigner: Send + Sync + Debug {
+    /// Sign the request by modifying its headers (and potentially other parts).
+    async fn sign(&self, parts: &mut http::request::Parts) -> Result<()>;
+}
+
+/// Blanket implementation of [`RequestSigner`] for any [`reqsign_core::Signer`].
+///
+/// This allows any reqsign signer (AWS SigV4, Google, Azure, etc.) to be used
+/// directly as a `RequestSigner`.
+#[async_trait]
+impl<K> RequestSigner for reqsign_core::Signer<K>
+where
+    K: reqsign_core::SigningCredential + 'static,
+{
+    async fn sign(&self, parts: &mut http::request::Parts) -> Result<()> {
+        reqsign_core::Signer::sign(self, parts, None)
+            .await
+            .map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "Failed to sign request").with_source(e)
+            })
+    }
+}
+
+/// `HttpSend` implementation using reqwest 0.12's `Client`.
+///
+/// This bridges reqsign-core's `HttpSend` trait (which uses `http` crate types)
+/// with the reqwest 0.12 client that the rest of the crate uses.
+#[derive(Debug)]
+struct ReqwestHttpSend(Client);
+
+#[async_trait]
+impl reqsign_core::HttpSend for ReqwestHttpSend {
+    async fn http_send(
+        &self,
+        req: http::Request<Bytes>,
+    ) -> reqsign_core::Result<http::Response<Bytes>> {
+        let req = Request::try_from(req).map_err(|e| {
+            reqsign_core::Error::unexpected("failed to convert request").with_source(e)
+        })?;
+
+        let resp = self.0.execute(req).await.map_err(|e| {
+            reqsign_core::Error::unexpected("failed to send HTTP request").with_source(e)
+        })?;
+
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.bytes().await.map_err(|e| {
+            reqsign_core::Error::unexpected("failed to read response body").with_source(e)
+        })?;
+
+        let mut response = http::Response::builder()
+            .status(status)
+            .body(body)
+            .map_err(|e| {
+                reqsign_core::Error::unexpected("failed to build response").with_source(e)
+            })?;
+        *response.headers_mut() = headers;
+        Ok(response)
+    }
+}
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -45,6 +117,8 @@ pub(crate) struct HttpClient {
     extra_oauth_params: HashMap<String, String>,
     /// Whether to disable header redaction in error logs (defaults to false for security).
     disable_header_redaction: bool,
+    /// Optional request signer applied to all outgoing requests.
+    request_signer: Option<Arc<dyn RequestSigner>>,
 }
 
 impl Debug for HttpClient {
@@ -60,6 +134,7 @@ impl HttpClient {
     /// Create a new http client.
     pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
         let extra_headers = cfg.extra_headers()?;
+        let request_signer = Self::build_config_signer(cfg)?;
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
             token: Mutex::new(cfg.token()),
@@ -68,6 +143,7 @@ impl HttpClient {
             extra_headers,
             extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
+            request_signer,
         })
     }
 
@@ -80,6 +156,10 @@ impl HttpClient {
             .then(|| cfg.extra_headers())
             .transpose()?
             .unwrap_or(self.extra_headers);
+        let request_signer = match self.request_signer {
+            Some(signer) => Some(signer),
+            None => Self::build_config_signer(cfg)?,
+        };
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
             token: Mutex::new(cfg.token().or_else(|| self.token.into_inner())),
@@ -96,6 +176,7 @@ impl HttpClient {
                 self.extra_oauth_params
             },
             disable_header_redaction: cfg.disable_header_redaction(),
+            request_signer,
         })
     }
 
@@ -197,6 +278,27 @@ impl HttpClient {
         Ok(())
     }
 
+    /// Build a request signer from config properties (e.g. SigV4 from `rest.sigv4-enabled`).
+    fn build_config_signer(cfg: &RestCatalogConfig) -> Result<Option<Arc<dyn RequestSigner>>> {
+        let Some((signing_name, signing_region)) = cfg.sigv4_config()? else {
+            return Ok(None);
+        };
+
+        let ctx = reqsign_core::Context::new()
+            .with_file_read(reqsign_file_read_tokio::TokioFileRead)
+            .with_http_send(ReqwestHttpSend(cfg.client().unwrap_or_default()))
+            .with_env(reqsign_core::OsEnv);
+
+        let credential_provider = reqsign_aws_v4::DefaultCredentialProvider::new();
+        let request_signer = reqsign_aws_v4::RequestSigner::new(&signing_name, &signing_region);
+
+        Ok(Some(Arc::new(reqsign_core::Signer::new(
+            ctx,
+            credential_provider,
+            request_signer,
+        ))))
+    }
+
     /// Authenticates the request by adding a bearer token to the authorization header.
     ///
     /// This method supports three authentication modes:
@@ -253,7 +355,41 @@ impl HttpClient {
     /// Executes the given `Request` and returns a `Response`.
     pub async fn execute(&self, mut request: Request) -> Result<Response> {
         request.headers_mut().extend(self.extra_headers.clone());
+
+        if let Some(signer) = &self.request_signer {
+            request = Self::apply_request_signer(signer.as_ref(), request).await?;
+        }
+
         Ok(self.client.execute(request).await?)
+    }
+
+    /// Apply a [`RequestSigner`] to a request.
+    ///
+    /// Converts between `reqwest::Request` and `http::request::Parts` for signing,
+    /// since the `RequestSigner` trait operates on the standard `http` types.
+    async fn apply_request_signer(
+        signer: &dyn RequestSigner,
+        request: Request,
+    ) -> Result<Request> {
+        // Convert reqwest::Request → http::Request → Parts
+        let http_request: http::Request<reqwest::Body> =
+            request.try_into().map_err(|e: reqwest::Error| {
+                Error::new(ErrorKind::Unexpected, "Failed to convert request for signing")
+                    .with_source(e)
+            })?;
+        let (mut parts, body) = http_request.into_parts();
+
+        signer.sign(&mut parts).await?;
+
+        // Reassemble: Parts → http::Request → reqwest::Request
+        let http_request = http::Request::from_parts(parts, body);
+        Request::try_from(http_request).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Failed to reconstruct request after signing",
+            )
+            .with_source(e)
+        })
     }
 
     // Queries the Iceberg REST catalog after authentication with the given `Request` and

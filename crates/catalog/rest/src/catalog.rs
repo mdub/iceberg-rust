@@ -52,6 +52,12 @@ pub const REST_CATALOG_PROP_URI: &str = "uri";
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 /// Disable header redaction in error logs (defaults to false for security)
 pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-redaction";
+/// Enable AWS SigV4 signing for REST catalog requests
+pub const REST_CATALOG_PROP_SIGV4_ENABLED: &str = "rest.sigv4-enabled";
+/// The AWS service name to use for SigV4 signing (e.g. "s3", "execute-api")
+pub const REST_CATALOG_PROP_SIGNING_NAME: &str = "rest.signing-name";
+/// The AWS region to use for SigV4 signing (e.g. "us-east-1")
+pub const REST_CATALOG_PROP_SIGNING_REGION: &str = "rest.signing-region";
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -304,6 +310,52 @@ impl RestCatalogConfig {
         }
 
         params
+    }
+
+    /// Get the SigV4 signing configuration, if enabled.
+    ///
+    /// Returns `Ok(Some((signing_name, signing_region)))` when `rest.sigv4-enabled` is `"true"`.
+    /// Returns an error if SigV4 is enabled but required properties are missing.
+    pub(crate) fn sigv4_config(&self) -> Result<Option<(String, String)>> {
+        let enabled = self
+            .props
+            .get(REST_CATALOG_PROP_SIGV4_ENABLED)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if !enabled {
+            return Ok(None);
+        }
+
+        let signing_region = self
+            .props
+            .get(REST_CATALOG_PROP_SIGNING_REGION)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "'{}' is required when '{}' is true",
+                        REST_CATALOG_PROP_SIGNING_REGION, REST_CATALOG_PROP_SIGV4_ENABLED
+                    ),
+                )
+            })?
+            .clone();
+
+        let signing_name = self
+            .props
+            .get(REST_CATALOG_PROP_SIGNING_NAME)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "'{}' is required when '{}' is true",
+                        REST_CATALOG_PROP_SIGNING_NAME, REST_CATALOG_PROP_SIGV4_ENABLED
+                    ),
+                )
+            })?
+            .clone();
+
+        Ok(Some((signing_name, signing_region)))
     }
 
     /// Check if header redaction is disabled in error logs.
@@ -2891,5 +2943,55 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog uri is required");
         }
+    }
+
+    #[test]
+    fn test_sigv4_config_disabled_by_default() {
+        let config = RestCatalogConfig::builder()
+            .uri("https://example.com".to_string())
+            .build();
+        assert!(config.sigv4_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_sigv4_config_enabled() {
+        let config = RestCatalogConfig::builder()
+            .uri("https://example.com".to_string())
+            .props(HashMap::from([
+                ("rest.sigv4-enabled".to_string(), "true".to_string()),
+                ("rest.signing-name".to_string(), "s3".to_string()),
+                ("rest.signing-region".to_string(), "us-east-1".to_string()),
+            ]))
+            .build();
+        let result = config.sigv4_config().unwrap();
+        assert_eq!(result, Some(("s3".to_string(), "us-east-1".to_string())));
+    }
+
+    #[test]
+    fn test_sigv4_config_missing_region() {
+        let config = RestCatalogConfig::builder()
+            .uri("https://example.com".to_string())
+            .props(HashMap::from([
+                ("rest.sigv4-enabled".to_string(), "true".to_string()),
+                ("rest.signing-name".to_string(), "s3".to_string()),
+            ]))
+            .build();
+        let err = config.sigv4_config().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("rest.signing-region"));
+    }
+
+    #[test]
+    fn test_sigv4_config_missing_name() {
+        let config = RestCatalogConfig::builder()
+            .uri("https://example.com".to_string())
+            .props(HashMap::from([
+                ("rest.sigv4-enabled".to_string(), "true".to_string()),
+                ("rest.signing-region".to_string(), "us-east-1".to_string()),
+            ]))
+            .build();
+        let err = config.sigv4_config().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("rest.signing-name"));
     }
 }
